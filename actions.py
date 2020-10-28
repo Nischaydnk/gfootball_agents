@@ -153,8 +153,8 @@ def is_free_player_in_front(obs, controlled_player_pos, controlled_player_dir, p
             return True
 
 
-def is_dangerous(obs, controlled_player_pos, controlled_player_dir):
-    front_of_player = get_future_pos(controlled_player_pos, controlled_player_dir, steps=2)
+def is_dangerous(obs, controlled_player_pos, direction):
+    front_of_player = get_future_pos(controlled_player_pos, direction, steps=2)
 
     for player in obs['right_team']:
         if distance(front_of_player, player) < SAFE_DISTANCE:
@@ -337,6 +337,62 @@ def cruise(obs, current_running_action):
         return Action.Dribble
 
     return current_running_action
+
+
+def play_9(obs, controlled_player_pos, controlled_player_dir):
+    controlled_player_pos_x = controlled_player_pos[0]
+    controlled_player_pos_y = controlled_player_pos[1]
+
+    is_one_on_one = True
+    marking_defs = []
+
+    for player in obs['right_team']:
+        player_x = player[0]
+        # player_y = player[1]
+        def_distance = distance(player, controlled_player_pos)
+        if def_distance < SAFE_DISTANCE:
+            marking_defs.append(player)
+
+        if player_x > controlled_player_pos_x:
+            is_one_on_one = False
+
+    if is_one_on_one:
+        if get_closest_running_dir(controlled_player_dir) != Action.Right:
+            return Action.Right
+        else:
+            if Action.Sprint not in obs['sticky_actions']:
+                return Action.Sprint
+            # TODO: dribble the goalie
+            return Action.Right
+
+    # play long ball to the winger
+    marking_defs_y = 0
+    for marking_def in marking_defs:
+        marking_defs_y += marking_def[1]
+
+    if not marking_defs:  # pass to higher winger
+        left_winger = obs['left_team'][8]
+        right_winger = obs['left_team'][10]
+        if left_winger[0] > right_winger[0]:
+            if Action.Top in obs['sticky_actions']:
+                return Action.LongPass
+            else:
+                return Action.Top
+        else:
+            if Action.Bottom in obs['sticky_actions']:
+                return Action.LongPass
+            else:
+                return Action.Bottom
+    elif marking_defs_y / len(marking_defs) >= controlled_player_pos_y:
+        if Action.Top in obs['sticky_actions']:
+            return Action.LongPass
+        else:
+            return Action.Top
+    else:
+        if Action.Bottom in obs['sticky_actions']:
+            return Action.LongPass
+        else:
+            return Action.Bottom
 
 
 def play_goalkeeper(obs, controlled_player_pos, controlled_player_dir):

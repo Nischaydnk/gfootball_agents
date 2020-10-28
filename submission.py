@@ -45,9 +45,7 @@ def agent(obs):
     def attack(obs, controlled_player_pos, controlled_player_dir, ball_pos):
         # Does the player we control have the ball?
         if obs['ball_owned_player'] == obs['active']:
-            distance_from_goal_x = controlled_player_pos[0] - 1
-            distance_from_goal_y = controlled_player_pos[1]
-            distance_from_goal = math.sqrt(distance_from_goal_x * distance_from_goal_x + distance_from_goal_y * distance_from_goal_y)
+            distance_from_goal = distance(controlled_player_pos, [1, 0])
             if distance_from_goal <= SHOOTING_DISTANCE:
                 return Action.Shot
 
@@ -57,11 +55,32 @@ def agent(obs):
             if int(obs['ball_owned_player']) == int(PlayerRole.GoalKeeper.value):
                 return play_goalkeeper(obs, controlled_player_pos, controlled_player_dir)
 
-            if abs(controlled_player_pos_y) > WING and controlled_player_pos_x > 0.3:
-                return wing_run(obs, controlled_player_pos)
-            else:
-                # return Action.ShortPass
-                return tiki_taka(obs, controlled_player_pos, controlled_player_dir)
+            if int(obs['ball_owned_player']) == int(PlayerRole.CentralFront.value):
+                return play_9(obs, controlled_player_pos, controlled_player_dir)
+
+            if abs(controlled_player_pos_y) > WING:
+                if controlled_player_pos_x > 0.3:
+                    return wing_run(obs, controlled_player_pos)
+                elif controlled_player_pos_x > 0 and Action.Right in obs['sticky_actions']:
+                    return Action.LongPass
+
+            preferred_action = Action.TopRight if controlled_player_pos_y <= 0 else Action.BottomRight
+            worse_action = Action.TopRight if controlled_player_pos_y > 0 else Action.BottomRight
+
+            is_safe = not is_opp_in_area(obs, controlled_player_pos)
+            if is_safe and controlled_player_dir[0] > 0:  # already running forward
+                if not is_dangerous(obs, controlled_player_pos, action_to_dir(Action.Right)):
+                    return Action.Right
+                elif not is_dangerous(obs, controlled_player_pos, action_to_dir(preferred_action)):
+                    return preferred_action
+                elif not is_dangerous(obs, controlled_player_pos, action_to_dir(worse_action)):
+                    return worse_action
+                else:
+                    return protect_ball(obs, controlled_player_pos)
+            elif is_safe:
+                return Action.Right
+
+            return tiki_taka(obs, controlled_player_pos, controlled_player_dir)
 
             # controlled_player_pos_y = controlled_player_pos[1]
             # if controlled_player_pos_y > WING:
