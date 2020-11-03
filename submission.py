@@ -1,11 +1,8 @@
 import traceback
 
 from kaggle_environments.envs.football.helpers import *
-from keydb import KeyDB
 
 from custom_agents.actions import *
-
-DB = KeyDB(host='localhost')
 
 
 @human_readable_agent
@@ -15,85 +12,57 @@ def agent(obs):
         ball_pos_x = ball_pos[0]
         ball_dir_x = ball_dir[0]
         ball_dir_y = ball_dir[1]
-        ball_height = ball_dir[2]
+        ball_2d_pos = [ball_pos[0], ball_pos[1]]
         ball_2d_dir = [ball_dir_x, ball_dir_y]
 
         controlled_player_pos_x = controlled_player_pos[0]
-        controlled_player_pos_y = controlled_player_pos[1]
-
-        goal_dir = [1 - controlled_player_pos_x, - controlled_player_pos_y]
-        goal_dir_action = get_closest_running_dir(goal_dir)
-
-        distance_from_goal = distance(ball_pos, [1, 0])
-        if distance_from_goal <= SHOOTING_DISTANCE and abs(controlled_player_pos_y) < SECTOR_SIZE:
-            if running_dir != goal_dir_action:
-                return goal_dir_action
-            return Action.Shot
 
         if abs(controlled_player_pos[1]) > WING:
             if controlled_player_pos[0] > HALF:
-                return wing_run(obs, controlled_player_pos, running_dir)
-
-        # directional first touch
-        ball_to_receiver_dir = direction(controlled_player_pos, ball_pos)
-        if ball_height < 0.03 and direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) < 30:
-            ball_speed = dir_distance(ball_2d_dir)
-            distance_to_ball = distance(ball_pos, controlled_player_pos)
-            if distance_to_ball < ball_speed and not is_opp_in_area(obs, controlled_player_pos):
-                return dribble_into_empty_space(obs, controlled_player_pos)
-            elif distance_to_ball < ball_speed:
-                return protect_ball(obs, controlled_player_pos)
-            else:
-                return get_closest_running_dir(opposite_dir(ball_to_receiver_dir))
-
-        if Action.Dribble in obs['sticky_actions']:
-            return Action.ReleaseDribble
+                return rush_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
 
         # steering goalkeeper
-        if int(obs['active']) == int(PlayerRole.GoalKeeper.value):
-            goalie_pos = obs['left_team'][PlayerRole.GoalKeeper.value]
-            d_goalie_to_ball = distance(goalie_pos, ball_pos)
-            if d_goalie_to_ball < SAFE_DISTANCE:
-                is_goalie_in_trouble = is_opp_in_sector(obs, ball_pos)
-                if not is_goalie_in_trouble:
-                    # TODO: what to do to NOT kick the ball?
-                    return play_goalkeeper(obs, controlled_player_pos, controlled_player_dir)
-            else:
-                if is_opp_in_sector(obs, ball_pos):
-                    return rush_to_defense(obs, controlled_player_pos, ball_pos)
-                else:
-                    return rush_toward_ball(obs, controlled_player_pos, ball_pos)
+        if is_goalkeeper(obs):
+            return rush_keeper(obs, controlled_player_pos, ball_2d_pos, ball_dir)
+            # goalie_pos = obs['left_team'][PlayerRole.GoalKeeper.value]
+            # d_goalie_to_ball = distance(goalie_pos, ball_pos)
+            # if d_goalie_to_ball < SAFE_DISTANCE:
+            #     is_goalie_in_trouble = is_opp_in_sector(obs, ball_pos)
+            #     if not is_goalie_in_trouble:
+            #         # TODO: what to do to NOT kick the ball?
+            #         return play_goalkeeper(obs, controlled_player_pos, controlled_player_dir)
+            # else:
+            #     if is_opp_in_sector(obs, ball_pos):
+            #         return rush_to_defense(obs, controlled_player_pos, ball_pos)
+            #     else:
+            #         return rush_toward_ball(obs, controlled_player_pos, ball_pos)
 
-        if ball_dir_x > 0 and controlled_player_pos[0] < ball_pos_x:
-            return rush_toward_ball(obs, controlled_player_pos, ball_pos)
+        # directional first touch
+        ball_to_receiver_dir = direction(controlled_player_pos, ball_2d_pos)
+        if direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) <= 30:
+            return react_to_incoming_ball(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir,
+                                          ball_to_receiver_dir, running_dir)
+
+        if ball_dir_x > 0 and controlled_player_pos_x < ball_pos_x:
+            return rush_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
+
         elif ball_pos_x > LAST_THIRD:
-            if distance(ball_pos, controlled_player_pos) > SAFE_DISTANCE:
-                return rush_toward_ball(obs, controlled_player_pos, ball_pos)
-            elif is_opp_in_area(obs, controlled_player_pos):
+            return rush_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
+
+        elif ball_pos_x > HALF:
+            if is_opp_in_area(obs, controlled_player_pos):
                 if controlled_player_dir[0] > 0 and is_dangerous(obs, controlled_player_pos, [0.05, 0]):
                     return Action.LongPass
-                elif controlled_player_dir[0] > 0:
-                    return dribble_into_empty_space(obs, controlled_player_pos)
+                elif controlled_player_dir[0] > 0 or running_dir == Action.Left:
+                    return rush_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
                 else:
-                    return tiki_taka(obs, controlled_player_pos, controlled_player_dir, running_dir)
+                    return Action.ShortPass
             else:
-                return dribble_into_empty_space(obs, controlled_player_pos)
-        elif ball_pos_x > -LAST_THIRD:
-            if Action.Sprint in obs['sticky_actions']:
-                return Action.ReleaseSprint
-            if is_opp_in_area(obs, ball_pos):
-                return protect_ball(obs, controlled_player_pos)  # return Action.ShortPass
-            else:
-                return run_toward_ball(obs, controlled_player_pos, ball_pos)
-        else:
-            if Action.Sprint in obs['sticky_actions']:
-                return Action.ReleaseSprint
-            if is_opp_in_area(obs, ball_pos):
-                return protect_ball(obs, controlled_player_pos)  # return Action.HighPass
-            else:
-                return run_toward_ball(obs, controlled_player_pos, ball_pos)
+                return rush_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
+        else:  # ball flying in our half
+            return rush_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
 
-    def attack(obs, controlled_player_pos, controlled_player_dir, running_dir, ball_pos):
+    def attack(obs, controlled_player_pos, controlled_player_dir, running_dir, ball_pos, ball_dir):
         # Does the player we control have the ball?
         if int(obs['ball_owned_player']) == int(obs['active']):
             controlled_player_pos_x = controlled_player_pos[0]
@@ -104,7 +73,14 @@ def agent(obs):
             distance_from_goal = dir_distance(goal_dir)
 
             if distance_from_goal <= SHOOTING_DISTANCE and abs(controlled_player_pos_y) < SECTOR_SIZE:
-                if running_dir != goal_dir_action:
+                if distance_from_goal <= SHORT_SHOOTING_DISTANCE:
+                    return Action.Shot
+
+                # if running_dir != goal_dir_action:
+                #     return goal_dir_action
+                if running_dir != goal_dir_action and controlled_player_pos_x <= 1 - SAFE_DISTANCE:
+                    if Action.Sprint in obs['sticky_actions']:
+                        return Action.ReleaseSprint
                     return goal_dir_action
                 return Action.Shot
 
@@ -112,99 +88,115 @@ def agent(obs):
             goal_distance = distance(controlled_player_pos, [1, 0])
             keeper_distance = get_goalkeeper_distance(obs, controlled_player_pos)
             if keeper_distance < goal_distance / 2:
-                if running_dir != goal_dir_action:
-                    return goal_dir_action
+                # if running_dir != goal_dir_action:
+                #     return goal_dir_action
+                # if running_dir != goal_dir_action and controlled_player_pos_x <= 1 - SAFE_DISTANCE:
+                #     if Action.Sprint in obs['sticky_actions']:
+                #         return Action.ReleaseSprint
+                #     return goal_dir_action
                 return Action.Shot
+
+            if controlled_player_pos_x > 1 - SAFE_DISTANCE:
+                if Action.Sprint in obs['sticky_actions']:
+                    return Action.ReleaseSprint
+                if Action.Dribble not in obs['sticky_actions']:
+                    return Action.Dribble
+
+                if controlled_player_pos_y > 0 and\
+                        (running_dir != Action.Top or Action.Top not in obs['sticky_actions']):
+                    return Action.Top
+                elif controlled_player_pos_y < 0 and \
+                        (running_dir != Action.Bottom or Action.Bottom not in obs['sticky_actions']):
+                    return Action.Bottom
+
+                if controlled_player_pos_y > HALF:
+                    if is_dangerous(obs, controlled_player_pos, [0, -SAFE_DISTANCE]):
+                        return cross(obs)
+                    return Action.Top
+                elif controlled_player_pos_y < -HALF:
+                    if is_dangerous(obs, controlled_player_pos, [0, SAFE_DISTANCE]):
+                        return cross(obs)
+                    return Action.Bottom
+                else:
+                    return Action.Shot
 
             is_one_on_one, marking_defs = is_1_on_1(obs, controlled_player_pos)
 
-            if is_one_on_one and abs(controlled_player_pos_y) < SECTOR_SIZE:
-                if running_dir != goal_dir_action:
-                    return goal_dir_action
-                else:
-                    if Action.Sprint not in obs['sticky_actions']:
-                        return Action.Sprint
-                    # TODO: dribble the goalie
-                    return Action.Right
+            if is_one_on_one and abs(controlled_player_pos_y) < WING:
+                return finalize_action(obs, controlled_player_pos, goal_dir_action)
 
-            if int(obs['ball_owned_player']) == int(PlayerRole.GoalKeeper.value):
-                return play_goalkeeper(obs, controlled_player_pos, controlled_player_dir)
+            if is_goalkeeper(obs):
+                return goalkeeper_play(obs, controlled_player_pos, controlled_player_dir, running_dir)
 
-            if int(obs['ball_owned_player']) == int(PlayerRole.CentralFront.value):  # or (0 < controlled_player_pos_x < 0.2 and -0.15 < controlled_player_pos_y < 0.15):
-                return play_9(obs, controlled_player_pos, running_dir, marking_defs)
+            if abs(controlled_player_pos_y) >= WING:
+                return wing_play(obs, controlled_player_pos, running_dir, ball_pos, ball_dir)
 
-            if controlled_player_pos_x > 1 - SAFE_DISTANCE:
-                if controlled_player_pos_y > HALF:
-                    return Action.Top
-                else:
-                    return Action.Bottom
-
-            if abs(controlled_player_pos_y) > WING:
-                if controlled_player_pos_x > LAST_THIRD:
-                    return wing_run(obs, controlled_player_pos, running_dir)
-                elif running_dir == Action.Right and is_dangerous(obs, controlled_player_pos, [SAFE_DISTANCE, 0]):
-                    return Action.LongPass
-                elif running_dir == Action.Right:
-                    return Action.Right
-                elif is_opp_in_area(obs, controlled_player_pos):
-                    return protect_ball(obs, controlled_player_pos)
-                else:
-                    return dribble_into_empty_space(obs, controlled_player_pos)
+            is_9 = int(obs['ball_owned_player']) == int(PlayerRole.CentralFront.value)
+            if controlled_player_pos_x > -LAST_THIRD and is_9:  # or (0 < controlled_player_pos_x < 0.2 and -0.15 < controlled_player_pos_y < 0.15):
+                return play_9(obs, controlled_player_pos, running_dir, marking_defs, goal_dir_action)
 
             if controlled_player_pos_x > LAST_THIRD:
-                return dribble_into_empty_space(obs, controlled_player_pos)
+                return finalize_action(obs, controlled_player_pos, goal_dir_action)
 
-            if controlled_player_pos_x < -LAST_THIRD:
-                return protect_ball(obs, controlled_player_pos)
+            if controlled_player_pos_x > -LAST_THIRD:
+                return midfield_play(obs, controlled_player_pos, running_dir)
 
-            # is_safe = not is_opp_in_area(obs, controlled_player_pos)
-            # if is_safe and controlled_player_dir[0] > 0:  # already running forward
-            #     return dribble_into_empty_space(obs, controlled_player_pos)
-            # elif is_safe:
-            #     return Action.Right
+            if controlled_player_pos_x <= -LAST_THIRD:
+                if obs['ball_owned_player'] in [PlayerRole.LeftBack, PlayerRole.RightBack]:
+                    return protect_ball(obs, controlled_player_pos, running_dir)
+                else:
+                    return center_back_play(obs, controlled_player_pos, running_dir)
 
-            return tiki_taka(obs, controlled_player_pos, controlled_player_dir, running_dir)
-
-            # controlled_player_pos_y = controlled_player_pos[1]
-            # if controlled_player_pos_y > WING:
-            #     DB.set('football__last_side', 'right')
-            #     return wing_run(obs, controlled_player_pos)
-            #     # return switch_side(obs, controlled_player_pos, controlled_player_dir, last_side='right')
-            # elif controlled_player_pos_y < -WING:
-            #     DB.set('football__last_side', 'left')
-            #     return wing_run(obs, controlled_player_pos)
-            #     # return switch_side(obs, controlled_player_pos, controlled_player_dir, last_side='left')
-            # else:
-            #     last_side = DB.get('football__last_side')
-            #     if not last_side:
-            #         last_side = 'left'
-            #     return switch_side(obs, controlled_player_pos, controlled_player_dir, last_side=last_side)
+            # should never reach this
+            return dribble_into_empty_space(obs, controlled_player_pos, running_dir)
         else:
-            return run_toward_ball(obs, controlled_player_pos, ball_pos)
+            return run_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
 
-    def defend(obs, controlled_player_pos, controlled_player_dir, ball_pos):
+    def defend(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir):
         controlled_player_pos_x = controlled_player_pos[0]
+        # controlled_player_pos_y = controlled_player_pos[1]
         ball_pos_x = ball_pos[0]
 
-        if ball_pos_x > HALF and is_attacker(obs):  # attacking roles
-            return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos)
+        # ball is rightin front
+        # if abs(controlled_player_pos[1] - ball_pos[1]) < SAFE_DISTANCE and \
+        #         controlled_player_pos_x < ball_pos_x < controlled_player_pos_x + SECTOR_SIZE:
+        #     return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos)
 
-        elif ball_pos_x > HALF and controlled_player_pos_x > -LAST_THIRD:
-            # TODO: or retrieve depending on density around ball
+        if ball_pos_x > HALF and is_attacker(obs):  # attacking roles
+            return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
+
+        elif ball_pos_x > HALF:  # and is_defender(obs):
             return rush_to_defense(obs, controlled_player_pos, ball_pos)
 
-        # if controlling wrong player then run opposite to ball to change to proper player
-        # elif is_attacker(obs) and is_defender_behind(obs, controlled_player_pos):
-        #     return Action.Right
-        elif are_defenders_behind(obs, controlled_player_pos):
-            return Action.Right
+        elif ball_pos_x > -SECTOR_SIZE and is_defender(obs):
+            return rush_to_stop_ball(obs, controlled_player_pos, ball_pos)
 
-        return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos)
+        elif ball_pos_x > -SECTOR_SIZE and is_goalkeeper(obs):
+            return stay_front_of_goal(obs, controlled_player_pos, ball_pos)
+
+        elif ball_pos_x > -SECTOR_SIZE:
+            return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
+
+        elif ball_pos_x <= -SECTOR_SIZE:
+            return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
+        # if controlling wrong player then run opposite to ball to change to proper player
+        # elif are_defenders_behind(obs, controlled_player_pos):
+        #     return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
+
+        return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
 
     try:
         ball_pos = obs['ball']
         ball_dir = obs['ball_direction']
         game_mode = obs['game_mode']
+        ball_2d_pos = [ball_pos[0], ball_pos[1]]
+        ball_to_goal_distance = distance(ball_2d_pos, [1, 0])
+
+        if game_mode != GameMode.Normal:
+            if Action.Sprint in obs['sticky_actions']:
+                return Action.ReleaseSprint
+            if Action.Sprint in obs['sticky_actions']:
+                return Action.Dribble
 
         if game_mode == GameMode.Penalty:
             if Action.Sprint in obs['sticky_actions']:
@@ -213,7 +205,7 @@ def agent(obs):
 
         elif game_mode == GameMode.GoalKick:
             goalie_pos = obs['left_team'][0]
-            d_goalie_to_ball = distance(ball_pos, goalie_pos)
+            d_goalie_to_ball = distance(ball_2d_pos, goalie_pos)
             if d_goalie_to_ball < 1:  # is OUR goal kick
                 goalie_dir = obs['left_team_direction'][0]
                 goalie_action = get_closest_running_dir(goalie_dir)
@@ -225,12 +217,20 @@ def agent(obs):
         elif game_mode == GameMode.Corner:
             return Action.HighPass
 
-        elif game_mode == GameMode.FreeKick and ball_pos[0] < HALF:
+        elif game_mode == GameMode.ThrowIn:
+            if ball_pos[0] < LAST_THIRD:
+                return random.choice([Action.Right, Action.ShortPass])
+            else:
+                return Action.LongPass
+
+        elif game_mode == GameMode.FreeKick and ball_to_goal_distance <= FK_SHOOTING_DISTANCE:
+            return Action.Shot
+        elif game_mode == GameMode.FreeKick and ball_pos[0] >= LAST_THIRD:
+            return Action.ShortPass
+        elif game_mode == GameMode.FreeKick and ball_pos[0] < LAST_THIRD:
             return random.choice([Action.Top, Action.Bottom, Action.ShortPass])
 
         elif game_mode != GameMode.Normal:
-            if Action.Sprint in obs['sticky_actions']:
-                return Action.ReleaseSprint
             return Action.ShortPass
 
         ball_owned_team = obs['ball_owned_team']
@@ -241,9 +241,9 @@ def agent(obs):
         if ball_owned_team == -1:
             return transition(obs, controlled_player_pos, running_dir, ball_pos, ball_dir)
         elif ball_owned_team == 0:  # we have the ball
-            return attack(obs, controlled_player_pos, controlled_player_dir, running_dir, ball_pos)
+            return attack(obs, controlled_player_pos, controlled_player_dir, running_dir, ball_2d_pos, ball_dir)
         else:  # ball_owned_team = 1, opponents
-            return defend(obs, controlled_player_pos, controlled_player_dir, ball_pos)
+            return defend(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
     except Exception as e:
         with open('./error_log', mode='a') as f:
             f.write(traceback.format_exc())
