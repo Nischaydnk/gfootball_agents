@@ -462,6 +462,8 @@ def predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos,
     if best_x == -1:
         return rush_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
     best_y = ball_trajectory(best_x)
+    if best_y < -0.42 or best_y > 0.42:
+        return rush_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
 
     with open('./log', mode='a') as f:
         f.write(f'predicting works!!!, {best_x}, {best_y}')
