@@ -4,26 +4,38 @@ from enum import Enum
 import math
 import numpy as np
 from kaggle_environments.envs.football.helpers import Action, PlayerRole
-
+from stable_baselines import PPO2
 from sympy import symbols, Eq, solve
 
 WING = 0.32
 SAFE_DISTANCE = 0.085
+POST = 0.045
 SECTOR_SIZE = 0.2
-SHOOTING_DISTANCE = 0.32
+LONG_SHOOTING_DISTANCE = 0.4
+SHOOTING_DISTANCE = 0.36
 SHORT_SHOOTING_DISTANCE = 0.24
 FK_SHOOTING_DISTANCE = 0.3
 HALF = 0
 LAST_THIRD = 0.3
 BRAKING_DISTANCE = 0.26
 SLIDING_TACKLE_RANGE = 0.06
-FIRST_TOUCH_TIMING = 1.5
+FIRST_TOUCH_TIMING = 1
+FIELD_WIDTH = 0.42
 
-RUNNING_SPEED = 0.03
-DRIBBLING_SPEED = 0.03
-SPRINTING_SPEED = 0.05
+PASS_SPEED = 0.015
+RUNNING_SPEED = 0.01
+DRIBBLING_SPEED = 0.01
+SPRINTING_SPEED = 0.02
 
 SLIDING_TACKLE_MODE = 0
+USE_MODELS = True
+
+if USE_MODELS:
+    transfer_ball_up_field_model_version = 12
+    transfer_ball_up_field_model = PPO2.load(f'./models/transfer_ball_up_field.v{transfer_ball_up_field_model_version}')
+
+    assist_cross_model_version = 20
+    assist_cross_model = PPO2.load(f'./models/assist_cross.v{assist_cross_model_version}')
 
 
 class SlidingTackleMode(Enum):
@@ -40,29 +52,135 @@ def print_sticky_actions(obs):
 
 # HELPERS
 
+def solve_eq(l1, l2a, l2b):
+    x = 1
+    solutions = []
+    while x > -1:
+        y1 = l1(x)
+        y2a = l2a(x)
+        y2b = l2b(x)
+        if abs(y1) < FIELD_WIDTH and ((abs(y2a) < FIELD_WIDTH and abs(y1 - y2a) < 0.005) or
+                                      (abs(y2b) < FIELD_WIDTH and abs(y1 - y2b) < 0.005)):
+            solutions.append([x, y1])
+            if len(solutions) == 2:
+                return solutions
+        x -= 0.0025
+    return solutions
+
+
+def solve_eq_lib(player_range, ball_dir_const, ball_trajectory, ball_trajectory_const, p_x, p_y):
+    x = symbols('x')
+    eq = Eq((x * ball_dir_const + ball_trajectory_const - p_y) * (x * ball_dir_const + ball_trajectory_const - p_y) -
+            (player_range * player_range - (x-p_x) * (x-p_x)), 0)
+    xs = solve(eq)
+    best_x = -1
+    best_y = -1
+    for x in xs:
+        try:
+            real_x = float(x)
+            if -1 < real_x < 1 - SAFE_DISTANCE:
+                best_y = ball_trajectory(real_x)
+                if abs(best_y) < FIELD_WIDTH and real_x > best_x:
+                    best_x = real_x
+        except:
+            continue
+    return best_x, best_y
+
+
+def custom_convert_observation(observation, fixed_positions):
+    def do_flatten(obj):
+        """Run flatten on either python list or numpy array."""
+        if type(obj) == list:
+            return np.array(obj).flatten()
+        return obj.flatten()
+
+    final_obs = []
+    for obs in observation:
+        o = []
+        if fixed_positions:
+            for i, name in enumerate(['left_team', 'left_team_direction',
+                                      'right_team', 'right_team_direction']):
+                o.extend(do_flatten(obs[name]))
+                # If there were less than 11vs11 players we backfill missing values
+                # with -1.
+                if len(o) < (i + 1) * 22:
+                    o.extend([-1] * ((i + 1) * 22 - len(o)))
+        else:
+            o.extend(do_flatten(obs['left_team']))
+            o.extend(do_flatten(obs['left_team_direction']))
+            o.extend(do_flatten(obs['right_team']))
+            o.extend(do_flatten(obs['right_team_direction']))
+
+        # If there were less than 11vs11 players we backfill missing values with
+        # -1.
+        # 88 = 11 (players) * 2 (teams) * 2 (positions & directions) * 2 (x & y)
+        if len(o) < 88:
+            o.extend([-1] * (88 - len(o)))
+
+        # ball position
+        o.extend(obs['ball'])
+        # ball direction
+        o.extend(obs['ball_direction'])
+        # one hot encoding of which team owns the ball
+        if obs['ball_owned_team'] == -1:
+            o.extend([1, 0, 0])
+        if obs['ball_owned_team'] == 0:
+            o.extend([0, 1, 0])
+        if obs['ball_owned_team'] == 1:
+            o.extend([0, 0, 1])
+
+        active = [0] * 11
+        if obs['active'] != -1:
+            active[obs['active']] = 1
+        o.extend(active)
+
+        game_mode = [0] * 7
+        game_mode[obs['game_mode'].value] = 1
+        o.extend(game_mode)
+        final_obs.append(o)
+    return np.array(final_obs, dtype=np.float32)
+
+
 def is_goalkeeper(obs):
-    return int(obs['active']) == int(PlayerRole.GoalKeeper.value)
+    player_roles = obs['left_team_roles']
+    active = obs['active']
+    return player_roles[active] == PlayerRole.GoalKeeper
+
+
+def is_9(obs):
+    player_roles = obs['left_team_roles']
+    return player_roles[obs['active']] == PlayerRole.CentralFront
+
+
+def is_mid_up_front(obs, controlled_player_pos):
+    return abs(controlled_player_pos[0]) < SECTOR_SIZE and abs(controlled_player_pos[1]) < SECTOR_SIZE
 
 
 def is_defender_or_gk(obs):
-    return obs['active'] in [PlayerRole.CenterBack,
-                             PlayerRole.DefenceMidfield,
-                             PlayerRole.LeftBack,
-                             PlayerRole.RightBack,
-                             PlayerRole.GoalKeeper]
+    player_roles = obs['left_team_roles']
+    role = player_roles[obs['active']]
+    return role in [PlayerRole.CenterBack,
+                    PlayerRole.DefenceMidfield,
+                    PlayerRole.LeftBack,
+                    PlayerRole.RightBack,
+                    PlayerRole.GoalKeeper]
 
 
 def is_defender(obs):
-    return obs['active'] in [PlayerRole.CenterBack,
-                             PlayerRole.DefenceMidfield,
-                             PlayerRole.LeftBack,
-                             PlayerRole.RightBack]
+    player_roles = obs['left_team_roles']
+    role = player_roles[obs['active']]
+    return role in [PlayerRole.CenterBack,
+                    PlayerRole.DefenceMidfield,
+                    PlayerRole.LeftBack,
+                    PlayerRole.RightBack]
 
 
 def is_attacker(obs):
-    return obs['active'] in [PlayerRole.CentralFront,
-                             PlayerRole.LeftMidfield,
-                             PlayerRole.RIghtMidfield]
+    player_roles = obs['left_team_roles']
+    role = player_roles[obs['active']]
+    return role in [PlayerRole.CentralFront,
+                    PlayerRole.LeftMidfield,
+                    PlayerRole.RIghtMidfield]
 
 
 def offside_line(obs):
@@ -73,7 +191,7 @@ def offside_line(obs):
             is_keeper = False
             continue
 
-        player_x = player[1]
+        player_x = player[0]
         if player_x > line:
             line = player_x
     return line
@@ -87,7 +205,7 @@ def defense_line(obs):
             is_keeper = False
             continue
 
-        player_x = player[1]
+        player_x = player[0]
         if player_x < line:
             line = player_x
     return line
@@ -107,7 +225,7 @@ def are_defenders_behind(obs, controlled_player_pos):
     controlled_distance_to_goal = distance(controlled_player_pos, [-1, 0])
     for player in obs['left_team']:
         distance_to_goal = distance(player, [-1, 0])
-        if distance_to_goal < controlled_distance_to_goal - 0.2:
+        if distance_to_goal < controlled_distance_to_goal - SAFE_DISTANCE:
             defs += 1
     return defs >= 3
 
@@ -117,8 +235,8 @@ def is_defender_blocking_pass(obs, controlled_player_pos, ball_2d_pos, ball_2d_d
 
     for player in obs['right_team']:
         ball_to_player_dir = direction(player, ball_2d_pos)
-        if player[0] < controlled_player_pos_x + SAFE_DISTANCE:
-            if direction_diff_deg(ball_2d_dir, ball_to_player_dir) <= 15:
+        if controlled_player_pos_x - SAFE_DISTANCE < player[0] < controlled_player_pos_x + SAFE_DISTANCE:
+            if direction_diff_deg(ball_2d_dir, ball_to_player_dir) <= 5:
                 return True
     return False
 
@@ -173,7 +291,8 @@ def direction_diff_deg(dir1, dir2):
 
 
 def get_future_pos(current_pos, current_dir, steps=1):
-    future_pos = [current_pos[0] + current_dir[0] * steps, current_pos[1] + current_dir[1] * steps]  # TODO: verify if dir is speed (change during step)
+    future_pos = [current_pos[0] + current_dir[0] * steps,
+                  current_pos[1] + current_dir[1] * steps]  # TODO: verify if dir is speed (change during step)
     return future_pos
 
 
@@ -270,7 +389,7 @@ def is_1_on_1(obs, controlled_player_pos):
         if def_distance < SAFE_DISTANCE:
             marking_defs.append(player)
 
-        if abs(player_y) - abs(controlled_player_pos[1]) < SECTOR_SIZE and player_x > controlled_player_pos_x:
+        if abs(player_y - controlled_player_pos[1]) < SECTOR_SIZE and player_x > controlled_player_pos_x + SAFE_DISTANCE:
             players_in_front += 1
 
     return players_in_front <= 1, marking_defs
@@ -389,49 +508,64 @@ def is_friend_in_sector(obs, position):
 
 # DIRECTIONAL
 
-def run_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir):
+def smart_dir(_dir):
+    dir_x = _dir[0]
+    if dir_x >= 0:
+        return [dir_x / 2, _dir[1]]
+    else:
+        return [2 * dir_x, _dir[1]]
+
+
+def walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir):
     if Action.Sprint in obs['sticky_actions']:
         return Action.ReleaseSprint
 
     ball_2d_dir = [ball_dir[0], ball_dir[1]]
     ball_speed = dir_distance(ball_2d_dir)
     if ball_speed > SPRINTING_SPEED:
-        future_ball_pos = get_future_pos(ball_pos, ball_2d_dir, steps=6)
+        future_ball_pos = get_future_pos(ball_2d_pos, ball_2d_dir, steps=6)
     else:
-        future_ball_pos = get_future_pos(ball_pos, ball_2d_dir, steps=1)
+        future_ball_pos = get_future_pos(ball_2d_pos, ball_2d_dir, steps=1)
     direction_to_ball = direction(future_ball_pos, controlled_player_pos)
-    return get_closest_running_dir(direction_to_ball)
+    running_dir = get_closest_running_dir(direction_to_ball)
+    if ball_2d_pos[0] < -1 + SAFE_DISTANCE / 2 and abs(controlled_player_pos[1]) <= POST and running_dir == Action.Left:
+        return Action.ReleaseDirection
+    return running_dir
 
 
-def rush_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir):
-    d = distance(ball_2d_pos, controlled_player_pos)
-    if d < SAFE_DISTANCE:
-        return run_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
-
+def sprint_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir):
     if Action.Sprint not in obs['sticky_actions']:
         return Action.Sprint
 
+    d = distance(ball_2d_pos, controlled_player_pos)
     if d > 0.5:
-        steps = 9
+        steps = 8
     elif d > SECTOR_SIZE:
-        steps = 3
+        steps = 4
     else:
-        steps = 1
+        steps = 2
 
     future_ball_pos = get_future_pos(ball_2d_pos, ball_dir, steps=steps)
-    direction_to_future_ball = direction(future_ball_pos, controlled_player_pos)
-    return get_closest_running_dir(direction_to_future_ball)
+    direction_to_future_ball = smart_dir(direction(future_ball_pos, controlled_player_pos))
+    running_dir = get_closest_running_dir(direction_to_future_ball)
+    if ball_2d_pos[0] < -1 + SAFE_DISTANCE / 2 and abs(controlled_player_pos[1]) <= POST and running_dir == Action.Left:
+        return Action.ReleaseDirection
+    return running_dir
 
 
 def predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos, ball_dir):
-    d = distance(ball_2d_pos, controlled_player_pos)
-    if d < SAFE_DISTANCE:
-        return run_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
+    def fallback():
+        future_ball_pos = get_future_pos(ball_2d_pos, ball_dir, steps=1)
+        direction_to_future_ball = smart_dir(direction(future_ball_pos, controlled_player_pos))
+        running_dir = get_closest_running_dir(direction_to_future_ball)
+        return running_dir
 
-    if Action.Sprint not in obs['sticky_actions']:
-        return Action.Sprint
-
+    to_ball_dir = direction(ball_2d_pos, controlled_player_pos)
+    d = dir_distance(to_ball_dir)
     ball_speed = dir_distance(ball_dir)
+    if ball_speed < PASS_SPEED or d < SPRINTING_SPEED:
+        return fallback()
+
     player_speed = dir_distance(controlled_player_dir)
     p_x = controlled_player_pos[0]
     p_y = controlled_player_pos[1]
@@ -439,44 +573,86 @@ def predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos,
     steps = d / ball_speed
     player_range = max([player_speed, RUNNING_SPEED]) * steps
 
-    ball_dir_const = ball_dir[0] / ball_dir[1]
-    ball_trajectory_const = ball_2d_pos[1] - ball_2d_pos[0] * ball_dir_const
-    ball_trajectory = lambda x: x * ball_dir_const + ball_trajectory_const
-    # player_trajectory = lambda x: math.sqrt((x-p_x) * (x-p_x) - player_range * player_range + p_y)
+    player_trajectory_1 = lambda x: math.sqrt(player_range * player_range - (x - p_x) * (x - p_x)) + p_y if \
+        abs(x - p_x) < player_range else -1
+    player_trajectory_2 = lambda x: p_y - math.sqrt(player_range * player_range - (x - p_x) * (x - p_x)) if \
+        abs(x - p_x) < player_range else -1
 
-    x = symbols('x')
-    eq = Eq(((x-p_x) * (x-p_x) - player_range * player_range + p_y) *
-            ((x-p_x) * (x-p_x) - player_range * player_range + p_y) -
-            x * ball_dir_const + ball_trajectory_const, 0)
-    xs = solve(eq)
+    ball_pos_x = ball_2d_pos[0]
+    ball_dir_x = ball_dir[0]
+    ball_dir_y = ball_dir[1]
+    if ball_dir_x != 0:
+        ball_dir_const = ball_dir_y / ball_dir_x
+        ball_trajectory_const = ball_2d_pos[1] - ball_2d_pos[0] * ball_dir_const
+        ball_trajectory = lambda x: x * ball_dir_const + ball_trajectory_const
+
+        solutions = solve_eq(ball_trajectory, player_trajectory_1, player_trajectory_2)
+    else:
+        sol1_y = player_trajectory_1(ball_pos_x)
+        sol2_y = player_trajectory_2(ball_pos_x)
+        solutions = [
+            [ball_pos_x, sol1_y],
+            [ball_pos_x, sol2_y]
+        ]
+
+    if not solutions:
+        return fallback()
+
     best_x = -1
-    for x in xs:
-        try:
-            real_x = float(x)
-            if -1 < real_x < 1 - SAFE_DISTANCE:
-                if real_x > best_x:
-                    best_x = real_x
-        except:
-            continue
+    best_y = -1
+    if d < player_range:  # ball is inside the cirle of player range
+        if ball_dir[0] >= 0:  # take solution further to RIGHT
+            for x, y in solutions:
+                if x > ball_2d_pos[0]:
+                    best_x = x
+                    best_y = y
+        else:  # take solution further to LEFT
+            for x, y in solutions:
+                if x < ball_2d_pos[0]:
+                    best_x = x
+                    best_y = y
+    else:  # ball is outside, going from far
+        for x, y in solutions:  # take solution further to RIGHT
+            if x > best_x:
+                best_x = x
+                best_y = y
 
     if best_x == -1:
-        return rush_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
-    best_y = ball_trajectory(best_x)
-    if best_y < -0.42 or best_y > 0.42:
-        return rush_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
+        return fallback()
 
-    with open('./log', mode='a') as f:
-        f.write(f'predicting works!!!, {best_x}, {best_y}')
-        f.write('\n')
+    # with open('./game_log', mode='a') as f:
+    #     f.write(f'predicting, {best_x}, {best_y}, {ball_speed}')
+    #     f.write('\n')
     first_touch_point = [best_x, best_y]
     direction_to_future_ball = direction(first_touch_point, controlled_player_pos)
     return get_closest_running_dir(direction_to_future_ball)
 
 
+def receive_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos, ball_dir):
+    controlled_player_pos_x = controlled_player_pos[0]
+    controlled_player_pos_y = controlled_player_pos[1]
+    ball_dir_x = ball_dir[0]
+    ball_dir_y = ball_dir[1]
+
+    if ball_dir_x == 0:
+        if abs(controlled_player_pos_y - ball_dir_y) < 0.01:
+            return Action.ReleaseDirection
+        else:
+            return walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
+
+    ball_dir_const = ball_dir_y / ball_dir_x
+    ball_trajectory_const = ball_2d_pos[1] - ball_2d_pos[0] * ball_dir_const
+    ball_trajectory = lambda x: x * ball_dir_const + ball_trajectory_const
+    if abs(controlled_player_pos_y - ball_trajectory(controlled_player_pos_x)) < 0.01:
+        return Action.ReleaseDirection
+    else:
+        return walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
+
+
 def rush_keeper(obs, controlled_player_pos, ball_2d_pos, ball_dir):
     d = distance(ball_2d_pos, controlled_player_pos)
     if d < SAFE_DISTANCE:
-        return run_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
+        return walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
 
     if Action.Sprint not in obs['sticky_actions']:
         return Action.Sprint
@@ -495,19 +671,32 @@ def rush_keeper(obs, controlled_player_pos, ball_2d_pos, ball_dir):
 
 # ATTACK
 
-def center_back_play(obs, controlled_player_pos, running_dir):
+def center_back_play(obs, controlled_player_pos, running_dir, modeled_action):
     controlled_player_pos_x = controlled_player_pos[0]
     controlled_player_pos_y = controlled_player_pos[1]
 
-    if controlled_player_pos_y < -SAFE_DISTANCE and running_dir == Action.TopLeft:
-        if Action.Sprint not in obs['sticky_actions']:
-            return Action.Sprint
-    if controlled_player_pos_y > SAFE_DISTANCE and running_dir == Action.BottomLeft:
-        if Action.Sprint not in obs['sticky_actions']:
-            return Action.Sprint
-
+    # if controlled_player_pos_y < -SAFE_DISTANCE and running_dir == Action.TopLeft:
+    #     if Action.Sprint not in obs['sticky_actions']:
+    #         return Action.Sprint
+    # if controlled_player_pos_y > SAFE_DISTANCE and running_dir == Action.BottomLeft:
+    #     if Action.Sprint not in obs['sticky_actions']:
+    #         return Action.Sprint
     if Action.Sprint in obs['sticky_actions']:
         return Action.ReleaseSprint
+
+    mod_obs = custom_convert_observation([obs], None)
+    action, _states = transfer_ball_up_field_model.predict(mod_obs)
+    if action is not None:
+        return Action(int(action) + 1)
+
+    # if modeled_action is not None:
+    #     try:
+    #         return Action(int(modeled_action))
+    #     except:
+    #         pass
+
+    if running_dir == Action.Left or Action.Left in obs['sticky_actions']:  # never pass straight back left
+        return protect_ball(obs, controlled_player_pos, running_dir)
 
     if is_opp_in_area(obs, controlled_player_pos):
         if controlled_player_pos_x < -LAST_THIRD:
@@ -515,9 +704,6 @@ def center_back_play(obs, controlled_player_pos, running_dir):
                 return Action.ShortPass
             elif controlled_player_pos_y > 0 and Action.Top not in obs['sticky_actions']:
                 return Action.ShortPass
-
-    if running_dir == Action.Left or Action.Left in obs['sticky_actions']:  # never pass straight back left
-        return protect_ball(obs, controlled_player_pos, running_dir)
 
     # striker = obs['left_team'][PlayerRole.CentralFront.value]
     # is_striker_marked = is_opp_in_sector(obs, striker)
@@ -550,21 +736,23 @@ def pass_to_wingers(obs, controlled_player_pos, running_dir):
         elif not is_dangerous(obs, controlled_player_pos, [0, SAFE_DISTANCE]):
             return Action.Bottom
         else:
-            return Action.HighPass
+            return protect_ball(obs, controlled_player_pos, running_dir)
     else:
         if not is_dangerous(obs, controlled_player_pos, [SAFE_DISTANCE, -SAFE_DISTANCE]):
             return Action.TopRight
         elif not is_dangerous(obs, controlled_player_pos, [0, -SAFE_DISTANCE]):
             return Action.Top
         else:
-            return Action.HighPass
+            return protect_ball(obs, controlled_player_pos, running_dir)
 
 
-def midfield_play(obs, controlled_player_pos, running_dir):
+def midfield_play(obs, controlled_player_pos, running_dir, modeled_action):
     if running_dir == Action.Left or Action.Left in obs['sticky_actions']:  # never pass straight back left
         return protect_ball(obs, controlled_player_pos, running_dir)
 
-    striker = obs['left_team'][PlayerRole.CentralFront.value]
+    roles = obs['left_team_roles']
+    index = roles.index(PlayerRole.CentralFront)
+    striker = obs['left_team'][index]
     is_striker_marked = is_opp_in_sector(obs, striker)
     if not is_offside(obs, striker[0]) and not is_striker_marked:
         if running_dir == Action.Right and Action.Right in obs['sticky_actions']:
@@ -579,22 +767,42 @@ def midfield_play(obs, controlled_player_pos, running_dir):
                 any([action in obs['sticky_actions'] for action in [Action.Right, Action.TopRight, Action.BottomRight]]):
             return Action.LongPass
 
+    mod_obs = custom_convert_observation([obs], None)
+    action, _states = transfer_ball_up_field_model.predict(mod_obs)
+    if action is not None:
+        return Action(int(action) + 1)
+
+    # if modeled_action is not None:
+    #     try:
+    #         return Action(int(modeled_action))
+    #     except:
+    #         pass
+
     return pass_to_wingers(obs, controlled_player_pos, running_dir)
 
 
-def wing_play(obs, controlled_player_pos, running_dir, ball_pos, ball_dir):
+def wing_play(obs, controlled_player_pos, running_dir, ball_pos, ball_dir, modeled_action):
     controlled_player_pos_x = controlled_player_pos[0]
+    controlled_player_pos_y = controlled_player_pos[1]
 
     if controlled_player_pos_x > LAST_THIRD:
-        return wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir)
-    elif running_dir == Action.Right:
+        return wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir, modeled_action)
+    elif running_dir in [Action.Right, Action.TopRight, Action.BottomRight]:
         if is_dangerous(obs, controlled_player_pos, [SAFE_DISTANCE, 0]):
             if is_friend_in_front(obs, controlled_player_pos):
-                return Action.HighPass
+                if abs(controlled_player_pos_y) < 0.4:
+                    if controlled_player_pos_y > 0 and Action.BottomRight not in obs['sticky_actions']:
+                        return Action.BottomRight
+                    elif controlled_player_pos_y < 0 and Action.TopRight not in obs['sticky_actions']:
+                        return Action.TopRight
+                return Action.LongPass
             else:
                 return dribble_into_empty_space(obs, controlled_player_pos, running_dir)
         else:
-            return wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir)
+            if controlled_player_pos_x < HALF and offside_line(obs) > LAST_THIRD:
+                return dribble_into_empty_space(obs, controlled_player_pos, running_dir)
+            else:
+                return wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir, modeled_action)
     elif running_dir == Action.Left and Action.Left in obs['sticky_actions']:
         if is_dangerous(obs, controlled_player_pos, [SAFE_DISTANCE, 0]):
             if is_friend_on_wing_back(obs, controlled_player_pos):
@@ -603,12 +811,12 @@ def wing_play(obs, controlled_player_pos, running_dir, ball_pos, ball_dir):
             if Action.Dribble not in obs['sticky_actions']:
                 return Action.Dribble
 
-            if controlled_player_pos_x > -LAST_THIRD:
+            if controlled_player_pos_x >= -1 + SHOOTING_DISTANCE:
                 if Action.Sprint not in obs['sticky_actions']:
                     return Action.Sprint
                 return Action.Left
 
-            if controlled_player_pos_x < -LAST_THIRD:
+            if controlled_player_pos_x < -1 + SHOOTING_DISTANCE:
                 if Action.Sprint in obs['sticky_actions']:
                     return Action.ReleaseSprint
                 return Action.ShortPass
@@ -618,19 +826,31 @@ def wing_play(obs, controlled_player_pos, running_dir, ball_pos, ball_dir):
         return dribble_into_empty_space(obs, controlled_player_pos, running_dir)
 
 
-def wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir):
+def wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir, modeled_action):
     controlled_player_pos_x = controlled_player_pos[0]
     controlled_player_pos_y = controlled_player_pos[1]
+    ball_pos_y = ball_pos[1]
 
     if controlled_player_pos_x > 1 - BRAKING_DISTANCE:
         if Action.Sprint in obs['sticky_actions']:
             return Action.ReleaseSprint
 
+        mod_obs = custom_convert_observation([obs], None)
+        action, _states = assist_cross_model.predict(mod_obs)
+        if action is not None:
+            return Action(int(action) + 1)
+
+        # if modeled_action is not None:
+        #     try:
+        #         return Action(int(modeled_action))
+        #     except:
+        #         pass
+
         if is_opp_in_area(obs, controlled_player_pos):
             goal_dir = [1 - controlled_player_pos_x, - controlled_player_pos_y]
             goal_dir_action = get_closest_running_dir(goal_dir)
             if running_dir in [goal_dir_action, Action.Top, Action.Bottom]:
-                return cross(obs)
+                return cross(obs, running_dir)
             else:
                 return goal_dir_action
 
@@ -646,47 +866,51 @@ def wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir):
             return Action.Top
         else:
             return Action.Bottom
-    elif controlled_player_pos_x > 1 - 2 * BRAKING_DISTANCE and not is_opp_in_area(obs, controlled_player_pos):
-        if Action.Sprint not in obs['sticky_actions']:
-            return Action.Sprint
+
+    # when ball will go out of play when keep sprinting
+    elif (ball_pos_y >= 0.38 and ball_dir[1] > 0) or (ball_pos_y <= -0.38 and ball_dir[1] < 0):
+        if Action.Sprint in obs['sticky_actions']:
+            return Action.ReleaseSprint
+
+    elif controlled_player_pos_x > 1 - 2 * BRAKING_DISTANCE:  # and not is_opp_in_area(obs, controlled_player_pos):
+        if any([action in obs['sticky_actions'] for action in [Action.Right, Action.TopRight, Action.BottomRight]]):
+            if Action.Sprint not in obs['sticky_actions']:
+                return Action.Sprint
         if controlled_player_pos_y > HALF:
             return Action.TopRight
         else:
             return Action.BottomRight
 
-    # account for weird situations when winger forgets to take the ball
-    if abs(ball_pos[1] - controlled_player_pos_y) > 0.01:
-        if Action.Sprint in obs['sticky_actions']:
-            return Action.ReleaseSprint
-    if ball_pos[0] < controlled_player_pos_x:
-        return rush_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
-
-    if running_dir != Action.Right or Action.Right not in obs['sticky_actions']:  # not in obs['sticky_actions']:
-        return Action.Right
-    if Action.Sprint not in obs['sticky_actions']:
-        return Action.Sprint
-    # TODO: is player in front then do else
-    return Action.Right
+    else:
+        if Action.Sprint not in obs['sticky_actions']:
+            return Action.Sprint
 
 
-def cross(obs):
+def cross(obs, running_dir):
     for player in obs['left_team']:
-        if player[0] > 1 - SHOOTING_DISTANCE and abs(player[1]) < SAFE_DISTANCE:
+        if player[0] > 1 - SHOOTING_DISTANCE and abs(player[1]) < SECTOR_SIZE / 2:
             return Action.ShortPass
     # is_9_ready = abs(obs['left_team'][PlayerRole.CentralFront.value][1]) <= SAFE_DISTANCE
     # if is_9_ready:
     #     return Action.ShortPass
-    return Action.HighPass
+    return running_dir
 
 
 def beat_goalkeeper(obs, controlled_player_pos):
     controlled_player_pos_y = controlled_player_pos[1]
     striker_y_to_x = abs(controlled_player_pos_y / controlled_player_pos[0])
 
-    goalie = obs['right_team'][PlayerRole.GoalKeeper.value]
+    roles = obs['right_team_roles']
+    index = roles.index(PlayerRole.GoalKeeper)
+    goalie = obs['right_team'][index]
     goalie_y = goalie[1]
     goal_to_keeper_axis = direction(goalie, [1, 0])
     goalie_y_to_x = abs(goal_to_keeper_axis[1] / goal_to_keeper_axis[0])
+
+    goal_dir = direction([1, 0], controlled_player_pos)
+    distance_to_keeper = distance(controlled_player_pos, goalie)
+    if distance_to_keeper > 0.5:  # TODO: set logical distance
+        return get_closest_running_dir(goal_dir)
 
     if goalie_y >= 0:
         if controlled_player_pos_y <= 0:
@@ -757,15 +981,27 @@ def cruise(obs, current_running_action):
     return current_running_action
 
 
-def finalize_action(obs, controlled_player_pos, goal_dir_action):
+def finalize_action(obs, controlled_player_pos, goal_dir_action, modeled_action):
     if controlled_player_pos[0] > 1 - BRAKING_DISTANCE:
         if Action.Sprint in obs['sticky_actions']:
             return Action.ReleaseSprint
+
+        mod_obs = custom_convert_observation([obs], None)
+        action, _states = assist_cross_model.predict(mod_obs)
+        if action is not None:
+            return Action(int(action) + 1)
+
+        # if modeled_action is not None:
+        #     try:
+        #         return Action(int(modeled_action))
+        #     except:
+        #         pass
+
     elif controlled_player_pos[0] < 1 - BRAKING_DISTANCE:
         if Action.Sprint not in obs['sticky_actions']:
             return Action.Sprint
-    if not is_opp_in_area(obs, controlled_player_pos):
-        return beat_goalkeeper(obs, controlled_player_pos)
+        if not is_opp_in_area(obs, controlled_player_pos):
+            return beat_goalkeeper(obs, controlled_player_pos)
     return goal_dir_action
 
 
@@ -793,47 +1029,75 @@ def dribble_into_empty_space(obs, controlled_player_pos, running_dir):
         return protect_ball(obs, controlled_player_pos, running_dir)
 
 
-def play_9(obs, controlled_player_pos, running_dir, marking_defs, goal_dir_action):
-    # TODO: WHAT HAPPENS HERE
+def play_9(obs, controlled_player_pos, running_dir, marking_defs, goal_dir_action, modeled_action):
     controlled_player_pos_x = controlled_player_pos[0]
     controlled_player_pos_y = controlled_player_pos[1]
 
-    if all([marking_def[0] < controlled_player_pos_x + SPRINTING_SPEED for marking_def in marking_defs]):
-        return finalize_action(obs, controlled_player_pos, goal_dir_action)
+    # def_line_x = offside_line(obs)
 
-    if any([action in obs['sticky_actions'] for action in [Action.TopRight, Action.BottomRight]]) and running_dir in [Action.Top, Action.TopRight, Action.BottomRight, Action.Bottom]:
-    #if running_dir in [Action.Top, Action.TopRight, Action.BottomRight, Action.Bottom]:
-        return Action.LongPass
+    # marking defs can be challenged
+    if marking_defs:
+        if all([marking_def[0] < controlled_player_pos_x + SPRINTING_SPEED for marking_def in marking_defs]):
+            return finalize_action(obs, controlled_player_pos, goal_dir_action, modeled_action)
 
     if Action.Sprint in obs['sticky_actions']:
         return Action.ReleaseSprint
-    if Action.Dribble not in obs['sticky_actions']:
-        return Action.Dribble
 
-    # play long ball to the winger
+    # marking defs position
     marking_defs_y = 0
     for marking_def in marking_defs:
         marking_defs_y += marking_def[1]
 
-    if not marking_defs:  # pass to higher winger
-        left_winger = obs['left_team'][PlayerRole.LeftMidfield.value]
-        right_winger = obs['left_team'][PlayerRole.RIghtMidfield.value]
+    roles = obs['left_team_roles']
+    lw_index = roles.index(PlayerRole.LeftMidfield)
+    left_winger = obs['left_team'][lw_index]
+    rw_index = roles.index(PlayerRole.LeftMidfield)
+    right_winger = obs['left_team'][rw_index]
+
+    if not marking_defs:  # pass to winger
+        if running_dir in [Action.Top, Action.TopRight, Action.Right, Action.BottomRight, Action.Bottom]:
+            wing_pass = long_pass_to_wingers(obs, left_winger, right_winger, running_dir)
+            if wing_pass is not None:
+                return wing_pass
+
+        if Action.Dribble not in obs['sticky_actions']:
+            return Action.Dribble
+
+        # turn towards higher positioned winger who is not offside
         if left_winger[0] > right_winger[0] and not is_offside(obs, left_winger[0]):
             return Action.TopRight
         elif not is_offside(obs, right_winger[0]):
             return Action.BottomRight
         else:
-            return protect_ball(obs, controlled_player_pos, running_dir)
-    elif marking_defs_y / len(marking_defs) >= controlled_player_pos_y:
-        # if running_dir == Action.Top:
-        #     return Action.TopRight
-        # else:
-        return Action.Top
+            return dribble_into_empty_space(obs, controlled_player_pos, running_dir)
     else:
-        # if running_dir == Action.Bottom:
-        #     return Action.BottomRight
-        # else:
-        return Action.Bottom
+        if running_dir in [Action.Left, Action.BottomLeft, Action.TopLeft]:
+            # turn opposite side to marking defs
+            if marking_defs_y / len(marking_defs) >= controlled_player_pos_y:
+                return Action.Top
+            else:
+                return Action.Bottom
+        else:
+            wing_pass = long_pass_to_wingers(obs, left_winger, right_winger, running_dir)
+            if wing_pass is not None:
+                return wing_pass
+            else:
+                return protect_ball(obs, controlled_player_pos, running_dir)
+
+
+def long_pass_to_wingers(obs, left_winger, right_winger, running_dir):
+    if Action.TopRight in obs['sticky_actions']:
+        if not is_offside(obs, left_winger[0]):
+            return Action.LongPass
+    if Action.BottomRight in obs['sticky_actions']:
+        if not is_offside(obs, right_winger[0]):
+            return Action.LongPass
+    elif running_dir in [Action.Top, Action.TopRight]:
+        return Action.TopRight
+    elif running_dir in [Action.BottomRight, Action.Bottom]:
+        return Action.BottomRight
+
+    return None
 
 
 def goalkeeper_play(obs, controlled_player_pos, controlled_player_dir, running_dir):
@@ -906,15 +1170,12 @@ def retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_p
     ball_pos_x = ball_pos[0]
     controlled_player_pos_x = controlled_player_pos[0]
 
-    if controlled_player_pos_x > ball_pos_x:
+    if controlled_player_pos_x >= ball_pos_x:
         if Action.Sprint not in obs['sticky_actions']:
             return Action.Sprint
-    elif controlled_player_pos_x < ball_pos_x - 0.15:  # defender closer to goal than ball
+    else:  # controlled_player_pos_x < ball_pos_x:  # defender closer to goal than ball
         if Action.Sprint in obs['sticky_actions']:
             return Action.ReleaseSprint
-    else:
-        if Action.Sprint not in obs['sticky_actions']:
-            return Action.Sprint
 
     return get_closest_running_dir(direction_to_ball)
 
@@ -935,35 +1196,62 @@ def rush_to_defense(obs, controlled_player_pos, ball_pos):
     return get_closest_running_dir(direction_to_pos)
 
 
-def rush_to_stop_ball(obs, controlled_player_pos, ball_pos):
+def rush_to_own_goal(obs, controlled_player_pos, running_dir):
+    goal_dir = [-1 - controlled_player_pos[0], -controlled_player_pos[1]]
+    goal_dir_action = get_closest_running_dir(goal_dir)
+    if running_dir != goal_dir_action:
+        return goal_dir_action
+    if Action.Sprint not in obs['sticky_actions']:
+        return Action.Sprint
+    return goal_dir_action
+
+
+def rush_to_stop_ball(obs, controlled_player_pos, ball_pos, offside_trap=False):
     if Action.Sprint not in obs['sticky_actions']:
         return Action.Sprint
 
     ball_dir = obs['ball_direction']
-    future_ball_pos = get_future_pos(ball_pos, ball_dir, steps=3)
+    future_ball_pos = get_future_pos(ball_pos, ball_dir, steps=1)
 
     dir_ball_to_goal = direction_mul(direction([-1, 0], future_ball_pos), 1/4)
     position = add(future_ball_pos, dir_ball_to_goal)
+    # d = distance(position, controlled_player_pos)
 
-    d = distance(position, controlled_player_pos)
-
-    if d < SAFE_DISTANCE:
-        if Action.Sprint in obs['sticky_actions']:
-            return Action.ReleaseSprint
-    else:
-        if Action.Sprint not in obs['sticky_actions']:
-            return Action.Sprint
+    if offside_trap:
+        def_line_x = defense_line(obs)
+        position = [
+            max(position[0], def_line_x),
+            position[1]
+        ]
 
     direction_to_defense = direction(position, controlled_player_pos)
-    return get_closest_running_dir(direction_to_defense)
+    dir_action = get_closest_running_dir(direction_to_defense)
+
+    with open('./game_log', mode='a') as f:
+        f.write(f'futureballpos: {future_ball_pos}, position: {position}, dir: {direction_to_defense}')
+        f.write('\n')
+
+    return dir_action
+
+
+def control_attacker(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir):
+    if are_defenders_behind(obs, controlled_player_pos) or ball_pos[0] < controlled_player_pos[0]:
+        return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
+    else:
+        if Action.Sprint in obs['sticky_actions']:
+            return Action.ReleaseSprint
+        ball_distance = distance(ball_pos, controlled_player_pos)
+        if ball_distance < SAFE_DISTANCE and not is_opp_in_area(obs, ball_pos):
+            to_ball_dir = smart_dir(direction(ball_pos, controlled_player_pos))
+            return get_closest_running_dir(to_ball_dir)
+        else:
+            goal_dir = direction([-1, 0], controlled_player_pos)
+            return get_closest_running_dir(goal_dir)
 
 
 # GOALKEEPER
 
 def stay_front_of_goal(obs, controlled_player_pos, ball_pos):
-    if Action.Sprint not in obs['sticky_actions']:
-        return Action.Sprint
-
     ball_dir = obs['ball_direction']
     future_ball_pos = get_future_pos(ball_pos, ball_dir, steps=3)
 
@@ -972,12 +1260,14 @@ def stay_front_of_goal(obs, controlled_player_pos, ball_pos):
 
     d = distance(position, controlled_player_pos)
 
-    if d < SAFE_DISTANCE:
-        if Action.Sprint in obs['sticky_actions']:
-            return Action.ReleaseSprint
-    else:
-        if Action.Sprint not in obs['sticky_actions']:
-            return Action.Sprint
+    if Action.Sprint in obs['sticky_actions']:
+        return Action.ReleaseSprint
+    # if d < SAFE_DISTANCE:
+    #     if Action.Sprint in obs['sticky_actions']:
+    #         return Action.ReleaseSprint
+    # else:
+    #     if Action.Sprint not in obs['sticky_actions']:
+    #         return Action.Sprint
 
     direction_to_defense = direction(position, controlled_player_pos)
     return get_closest_running_dir(direction_to_defense)
@@ -991,7 +1281,7 @@ def react_to_incoming_ball(obs, controlled_player_pos, controlled_player_dir, ba
     ball_height = ball_pos[2]
     ball_2d_pos = [ball_pos[0], ball_pos[1]]
     ball_2d_dir = [ball_dir_x, ball_dir_y]
-    distance_from_goal = distance(ball_pos, [1, 0])
+    distance_from_goal = distance(ball_2d_pos, [1, 0])
 
     controlled_player_pos_x = controlled_player_pos[0]
     controlled_player_pos_y = controlled_player_pos[1]
@@ -1001,32 +1291,48 @@ def react_to_incoming_ball(obs, controlled_player_pos, controlled_player_dir, ba
 
     ball_speed = dir_distance(ball_2d_dir)
     distance_to_ball = distance(ball_pos, controlled_player_pos)
-    is_9 = int(obs['active']) == int(PlayerRole.CentralFront.value)
 
-    if distance_to_ball < ball_speed * FIRST_TOUCH_TIMING and ball_height < 0.03:
-        return first_touch(obs, controlled_player_pos, controlled_player_pos_x, controlled_player_pos_y, running_dir,
-                           goal_dir_action, distance_from_goal, is_9)
-    elif ball_dir_x > 0 and abs(ball_dir_x) > abs(ball_dir_y):
-        # TODO: WHY THEY DONT RUN WITH THE DEFENDER BLOCKING CLAUSE!!!
-        if is_defender_blocking_pass(obs, controlled_player_pos, ball_2d_pos, ball_2d_dir):
-            return run_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
-        else:
-            return predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
-    elif ball_dir_x <= 0:
-        return predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
+    # if controlled_player_pos_x < ball_pos[0] and distance_to_ball < ball_speed * FIRST_TOUCH_TIMING and ball_height < 0.15:
+    #     return first_touch(obs, controlled_player_pos, controlled_player_pos_x, controlled_player_pos_y, running_dir,
+    #                        goal_dir_action, distance_from_goal), 'transition react_to_incoming_ball first touch'
+
+    if ball_2d_pos[0] > 1 - SAFE_DISTANCE or controlled_player_pos[0] > ball_2d_pos[0]:
+        # TODO: if ball will surpass me then dont release sprint
+        if Action.Sprint in obs['sticky_actions']:
+            return Action.ReleaseSprint, 'transition react_to_incoming_ball'
     else:
-        return run_toward_ball(obs, controlled_player_pos, ball_pos, ball_dir)
+        if Action.Sprint not in obs['sticky_actions']:
+            return Action.Sprint, 'transition react_to_incoming_ball'
+
+    if ball_dir_x > 0 and abs(ball_dir_x) > abs(ball_dir_y):
+        if is_defender_blocking_pass(obs, controlled_player_pos, ball_2d_pos, ball_2d_dir):
+            return receive_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos, ball_dir), 'transition react_to_incoming_ball receive 1'
+        else:
+            return predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir), 'transition react_to_incoming_ball predict ball'
+    elif ball_dir_x <= 0:
+        return predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir), 'transition react_to_incoming_ball predict ball'
+    else:
+        return receive_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos, ball_dir), 'transition react_to_incoming_ball receive 2'
 
 
 def first_touch(obs, controlled_player_pos, controlled_player_pos_x, controlled_player_pos_y, running_dir,
-                goal_dir_action, distance_from_goal, is_9):
+                goal_dir_action, distance_from_goal):
+    # with open('./log', mode='a') as f:
+    #     f.write(f'first touch!!!, {distance_from_goal}, {controlled_player_pos}')
+    #     f.write('\n')
     if distance_from_goal <= SHOOTING_DISTANCE and abs(controlled_player_pos_y) < SECTOR_SIZE:
         return Action.Shot
+    if controlled_player_pos_x > 1 - SAFE_DISTANCE:
+        if controlled_player_pos_y > 0:
+            return Action.Top
+        else:
+            return Action.Bottom
+
     is_one_on_one = is_1_on_1(obs, controlled_player_pos)
 
-    if (is_9 or is_one_on_one) and abs(controlled_player_pos_y) < WING:
-        if Action.Sprint not in obs['sticky_actions']:
-            return Action.Sprint
+    if is_one_on_one and abs(controlled_player_pos_y) < WING:
+        # if Action.Sprint not in obs['sticky_actions']:
+        #     return Action.Sprint
         return goal_dir_action
     else:
         if is_opp_in_area(obs, controlled_player_pos):
