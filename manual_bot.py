@@ -11,15 +11,17 @@ SECTOR_SIZE = 0.2
 LONG_SHOOTING_DISTANCE = 0.4
 SHOOTING_DISTANCE = 0.36
 SHORT_SHOOTING_DISTANCE = 0.24
+SHOOTING_ANGLE = 1.5
 FK_SHOOTING_DISTANCE = 0.3
 HALF = 0
 LAST_THIRD = 0.3
-BRAKING_DISTANCE = 0.26
+BRAKING_DISTANCE_WING = 0.26
+BRAKING_DISTANCE_MIDDLE = 0.32
 SLIDING_TACKLE_RANGE = 0.06
 FIRST_TOUCH_TIMING = 1
 FIELD_WIDTH = 0.42
 
-PASS_SPEED = 0.015
+BALL_SPEED = 0.015
 RUNNING_SPEED = 0.01
 DRIBBLING_SPEED = 0.01
 SPRINTING_SPEED = 0.02
@@ -528,7 +530,7 @@ def predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos,
     to_ball_dir = direction(ball_2d_pos, controlled_player_pos)
     d = dir_distance(to_ball_dir)
     ball_speed = dir_distance(ball_dir)
-    if ball_speed < PASS_SPEED or d < SPRINTING_SPEED:
+    if ball_speed < BALL_SPEED or d < SPRINTING_SPEED:
         return fallback()
 
     player_speed = dir_distance(controlled_player_dir)
@@ -777,7 +779,7 @@ def wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir, modele
     controlled_player_pos_y = controlled_player_pos[1]
     ball_pos_y = ball_pos[1]
 
-    if controlled_player_pos_x > 1 - BRAKING_DISTANCE:
+    if controlled_player_pos_x > 1 - BRAKING_DISTANCE_WING:
         if Action.Sprint in obs['sticky_actions']:
             return Action.ReleaseSprint
 
@@ -818,7 +820,7 @@ def wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir, modele
         if Action.Sprint in obs['sticky_actions']:
             return Action.ReleaseSprint
 
-    elif controlled_player_pos_x > 1 - 2 * BRAKING_DISTANCE:  # and not is_opp_in_area(obs, controlled_player_pos):
+    elif controlled_player_pos_x > 1 - 2 * BRAKING_DISTANCE_WING:  # and not is_opp_in_area(obs, controlled_player_pos):
         if any([action in obs['sticky_actions'] for action in [Action.Right, Action.TopRight, Action.BottomRight]]):
             if Action.Sprint not in obs['sticky_actions']:
                 return Action.Sprint
@@ -830,6 +832,8 @@ def wing_run(obs, controlled_player_pos, running_dir, ball_pos, ball_dir, modele
     else:
         if Action.Sprint not in obs['sticky_actions']:
             return Action.Sprint
+
+    return Action.Right
 
 
 def cross(obs, running_dir):
@@ -928,7 +932,7 @@ def cruise(obs, current_running_action):
 
 
 def finalize_action(obs, controlled_player_pos, goal_dir_action, modeled_action):
-    if controlled_player_pos[0] > 1 - BRAKING_DISTANCE:
+    if controlled_player_pos[0] > 1 - BRAKING_DISTANCE_MIDDLE:
         if Action.Sprint in obs['sticky_actions']:
             return Action.ReleaseSprint
 
@@ -943,7 +947,7 @@ def finalize_action(obs, controlled_player_pos, goal_dir_action, modeled_action)
         #     except:
         #         pass
 
-    elif controlled_player_pos[0] < 1 - BRAKING_DISTANCE:
+    elif controlled_player_pos[0] < 1 - BRAKING_DISTANCE_MIDDLE:
         if Action.Sprint not in obs['sticky_actions']:
             return Action.Sprint
         if not is_opp_in_area(obs, controlled_player_pos):
@@ -1306,7 +1310,7 @@ def agent(obs, modeled_action=None):
                 return receive_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos, ball_dir)
 
         # is closest to ball
-        if ball_speed < PASS_SPEED and distance_to_ball < SAFE_DISTANCE and not is_opp_in_area(obs, ball_2d_pos):
+        if ball_speed < BALL_SPEED and distance_to_ball < SAFE_DISTANCE and not is_opp_in_area(obs, ball_2d_pos):
             return walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
 
         # stand in defense
@@ -1318,7 +1322,7 @@ def agent(obs, modeled_action=None):
 
         # chase ball on wing
         if abs(controlled_player_pos[1]) > WING and direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) > 30:  # and controlled_player_pos[0] > HALF:
-            if controlled_player_pos_x < 1 - BRAKING_DISTANCE or distance_to_ball > 0.025:
+            if controlled_player_pos_x < 1 - BRAKING_DISTANCE_WING or distance_to_ball > 0.025:
                 if (0 < controlled_player_pos_y < ball_pos_y or ball_pos_y < controlled_player_pos_y > 0) and abs(ball_to_receiver_dir[0]/ball_to_receiver_dir[1]) < 1.5:
                     return walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir)
                 else:
@@ -1329,9 +1333,9 @@ def agent(obs, modeled_action=None):
         # in short distance set shot before first touch
         distance_to_goal = distance([1, 0], ball_2d_pos)
         if distance_to_goal < SHORT_SHOOTING_DISTANCE and abs(controlled_player_pos[1]) < SECTOR_SIZE:
-            if ball_speed > PASS_SPEED and direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) <= 5 and ball_height < 0.15:
+            if ball_speed > BALL_SPEED and direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) <= 5 and ball_height < 0.15:
                 return Action.Shot
-            elif ball_speed > PASS_SPEED and ball_height < 0.15:
+            elif ball_speed > BALL_SPEED and ball_height < 0.15:
                 ball_dir_action = get_closest_running_dir(opposite_dir(ball_to_receiver_dir))
                 return random.choice([Action.Shot, ball_dir_action, ball_dir_action, ball_dir_action])
             else:
@@ -1358,11 +1362,11 @@ def agent(obs, modeled_action=None):
             distance_from_goal = dir_distance(goal_dir)
 
             # from close range shoot
-            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 1.25):
+            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE):
                 return Action.Shot
 
             if (distance_from_goal <= SHOOTING_DISTANCE and
-                (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 1.25)) or \
+                (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE)) or \
                     (Action.Sprint in obs['sticky_actions'] and distance_from_goal <= LONG_SHOOTING_DISTANCE and
                      (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 2)):
                 if goal_dir_action not in obs['sticky_actions']:
@@ -1552,4 +1556,4 @@ def agent(obs, modeled_action=None):
         else:  # ball_owned_team = 1, opponents
             return defend(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
     except Exception as e:
-        return Action.Idle, 'error'
+        return Action.Idle

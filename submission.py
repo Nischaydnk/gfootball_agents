@@ -31,7 +31,7 @@ def agent(obs, modeled_action=None):
                 return receive_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos, ball_dir), 'transition goalkeeper 2'
 
         # is closest to ball
-        if ball_speed < PASS_SPEED and distance_to_ball < SAFE_DISTANCE and not is_opp_in_area(obs, ball_2d_pos):
+        if ball_speed < BALL_SPEED and distance_to_ball < SAFE_DISTANCE and not is_opp_in_area(obs, ball_2d_pos):
             return walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir), 'transition closest'
 
         # stand in defense
@@ -43,7 +43,7 @@ def agent(obs, modeled_action=None):
 
         # chase ball on wing
         if abs(controlled_player_pos_y) > WING and direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) > 30:  # and controlled_player_pos[0] > HALF:
-            if controlled_player_pos_x < 1 - BRAKING_DISTANCE or distance_to_ball > 0.025:
+            if controlled_player_pos_x < 1 - BRAKING_DISTANCE_WING or distance_to_ball > 0.025:
                 if (0 < controlled_player_pos_y < ball_pos_y or ball_pos_y < controlled_player_pos_y > 0) and abs(ball_to_receiver_dir[0]/ball_to_receiver_dir[1]) < 1.5:
                     return walk_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir), 'transition wing 1'
                 else:
@@ -53,9 +53,9 @@ def agent(obs, modeled_action=None):
 
         distance_to_goal = distance([1, 0], ball_2d_pos)
         if distance_to_goal < SHORT_SHOOTING_DISTANCE and abs(controlled_player_pos_y) < SECTOR_SIZE:
-            if ball_speed > PASS_SPEED and direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) <= 5 and ball_height < 0.15:
+            if ball_speed > BALL_SPEED and direction_diff_deg(ball_2d_dir, ball_to_receiver_dir) <= 5 and ball_height < 0.15:
                 return Action.Shot, 'transition shot'
-            elif ball_speed > PASS_SPEED and ball_height < 0.15:
+            elif ball_speed > BALL_SPEED and ball_height < 0.15:
                 ball_dir_action = get_closest_running_dir(opposite_dir(ball_to_receiver_dir))
                 return random.choice([Action.Shot, ball_dir_action, ball_dir_action, ball_dir_action]), 'transition random shot'
             else:
@@ -79,11 +79,11 @@ def agent(obs, modeled_action=None):
             goal_dir_action = get_closest_running_dir(goal_dir)
             distance_from_goal = dir_distance(goal_dir)
 
-            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 1.25):
+            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE):
                 return Action.Shot, 'attack shot short'
 
             if (distance_from_goal <= SHOOTING_DISTANCE and
-                (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 1.25)) or \
+                (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE)) or \
                     (Action.Sprint in obs['sticky_actions'] and distance_from_goal <= LONG_SHOOTING_DISTANCE and
                      (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 2)):
                 if goal_dir_action not in obs['sticky_actions']:
