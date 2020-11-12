@@ -187,6 +187,15 @@ def defense_line(obs):
     return line
 
 
+def is_crowded(obs):
+    players_on_my_half = 0
+    for player in obs['right_team']:
+        player_x = player[0]
+        if player_x < HALF:
+            players_on_my_half += 1
+    return players_on_my_half >= 7
+
+
 def is_defender_behind(obs, controlled_player_pos):
     controlled_distance_to_goal = distance(controlled_player_pos, [-1, 0])
     for player in obs['left_team']:
@@ -651,6 +660,18 @@ def center_back_play(obs, controlled_player_pos, running_dir, modeled_action):
     if Action.Sprint in obs['sticky_actions']:
         return Action.ReleaseSprint
 
+    if is_crowded(obs):
+        if modeled_action is not None:
+            try:
+                return Action(int(modeled_action))
+            except:
+                pass
+
+        if any(action in obs['sticky_actions'] for action in [Action.TopRight, Action.BottomRight]):
+            return Action.HighPass
+        else:
+            return dribble_into_empty_space(obs, controlled_player_pos, running_dir)
+
     mod_obs = custom_convert_observation([obs], None)
     action, _states = transfer_ball_up_field_model.predict(mod_obs)
     if action is not None:
@@ -667,9 +688,11 @@ def center_back_play(obs, controlled_player_pos, running_dir, modeled_action):
 
     if is_opp_in_area(obs, controlled_player_pos):
         if controlled_player_pos_x < -LAST_THIRD:
-            if controlled_player_pos_y > 0 and Action.Top not in obs['sticky_actions']:
+            if controlled_player_pos_y > 0 and all(action not in obs['sticky_actions']
+                                                   for action in [Action.Top, Action.Right]):
                 return Action.ShortPass
-            elif controlled_player_pos_y > 0 and Action.Top not in obs['sticky_actions']:
+            elif controlled_player_pos_y < 0 and all(action not in obs['sticky_actions']
+                                                     for action in [Action.Bottom, Action.Right]):
                 return Action.ShortPass
 
     return pass_to_wingers(obs, controlled_player_pos, running_dir)
