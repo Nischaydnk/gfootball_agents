@@ -79,13 +79,13 @@ def agent(obs, modeled_action=None):
             goal_dir_action = get_closest_running_dir(goal_dir)
             distance_from_goal = dir_distance(goal_dir)
 
-            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE):
+            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs((1 - controlled_player_pos_x)/controlled_player_pos_y) >= SHORT_SHOOTING_ANGLE):
                 return Action.Shot, 'attack shot short'
 
             if (distance_from_goal <= SHOOTING_DISTANCE and
-                (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE)) or \
+                (controlled_player_pos_y == 0 or abs((1 - controlled_player_pos_x)/controlled_player_pos_y) >= SHOOTING_ANGLE)) or \
                     (Action.Sprint in obs['sticky_actions'] and distance_from_goal <= LONG_SHOOTING_DISTANCE and
-                     (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 2)):
+                     (controlled_player_pos_y == 0 or abs((1 - controlled_player_pos_x)/controlled_player_pos_y) >= LONG_SHOOTING_ANGLE)):
                 if goal_dir_action not in obs['sticky_actions']:
                     return goal_dir_action, 'attack shot long'
 
@@ -119,10 +119,10 @@ def agent(obs, modeled_action=None):
                         (running_dir != Action.Bottom or Action.Bottom not in obs['sticky_actions']):
                     return Action.Bottom, 'attack last inches'
 
-                mod_obs = custom_convert_observation([obs], None)
-                action, _states = assist_cross_model.predict(mod_obs)
-                if action is not None:
-                    return Action(int(action) + 1), 'modeled cross'
+                # mod_obs = custom_convert_observation([obs], None)
+                # action, _states = assist_cross_model.predict(mod_obs)
+                # if action is not None:
+                #     return Action(int(action) + 1), 'modeled cross'
 
                 # if modeled_action is not None:
                 #     try:
@@ -138,8 +138,10 @@ def agent(obs, modeled_action=None):
                     if is_dangerous(obs, controlled_player_pos, [0, SAFE_DISTANCE]):
                         return cross(obs, running_dir), 'attack cross'
                     return Action.Bottom, 'attack last inches'
-                else:
+                elif controlled_player_pos_y == 0:
                     return Action.Shot, 'attack last inches'
+                else:  # should never reach here
+                    return Action.Idle, 'attack last inches'
 
             is_one_on_one, marking_defs = is_1_on_1(obs, controlled_player_pos)
 
@@ -205,6 +207,8 @@ def agent(obs, modeled_action=None):
             return rush_to_stop_ball(obs, controlled_player_pos, ball_pos), 'defense rush_to_stop_ball 2'
 
         elif ball_pos_x > -1 + SECTOR_SIZE and ball_pos_x > controlled_player_pos_x:
+            if is_closest_to_ball(obs, controlled_player_pos, ball_2d_pos):
+                retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
             if are_defenders_behind(obs, controlled_player_pos):
                 return control_attacker(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir), 'defense control_attacker'
             else:

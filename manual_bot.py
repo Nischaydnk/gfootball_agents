@@ -1,4 +1,5 @@
 import random
+import traceback
 
 import math
 import numpy as np
@@ -11,7 +12,9 @@ SECTOR_SIZE = 0.2
 LONG_SHOOTING_DISTANCE = 0.4
 SHOOTING_DISTANCE = 0.36
 SHORT_SHOOTING_DISTANCE = 0.24
-SHOOTING_ANGLE = 1.5
+LONG_SHOOTING_ANGLE = 2
+SHOOTING_ANGLE = 1
+SHORT_SHOOTING_ANGLE = 0.75
 FK_SHOOTING_DISTANCE = 0.3
 HALF = 0
 LAST_THIRD = 0.3
@@ -188,12 +191,13 @@ def is_crowded(obs):
 
 
 def is_defender_behind(obs, controlled_player_pos):
+    defs = 0
     controlled_distance_to_goal = distance(controlled_player_pos, [-1, 0])
     for player in obs['left_team']:
         distance_to_goal = distance(player, [-1, 0])
-        if distance_to_goal < controlled_distance_to_goal - 0.2:
-            return True
-    return False
+        if distance_to_goal < controlled_distance_to_goal:
+            defs += 1
+    return defs >= 2  # including GK
 
 
 def are_defenders_behind(obs, controlled_player_pos):
@@ -515,11 +519,11 @@ def sprint_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir):
 
     d = distance(ball_2d_pos, controlled_player_pos)
     if d > 0.5:
-        steps = 8
+        steps = 9
     elif d > SECTOR_SIZE:
-        steps = 4
+        steps = 3
     else:
-        steps = 2
+        steps = 0
 
     future_ball_pos = get_future_pos(ball_2d_pos, ball_dir, steps=steps)
     direction_to_future_ball = smart_dir(direction(future_ball_pos, controlled_player_pos))
@@ -531,8 +535,8 @@ def sprint_toward_ball(obs, controlled_player_pos, ball_2d_pos, ball_dir):
 
 def predict_ball(obs, controlled_player_pos, controlled_player_dir, ball_2d_pos, ball_dir):
     def fallback():
-        future_ball_pos = get_future_pos(ball_2d_pos, ball_dir, steps=1)
-        direction_to_future_ball = smart_dir(direction(future_ball_pos, controlled_player_pos))
+        # future_ball_pos = get_future_pos(ball_2d_pos, ball_dir, steps=1)
+        direction_to_future_ball = smart_dir(direction(ball_2d_pos, controlled_player_pos))
         running_dir = get_closest_running_dir(direction_to_future_ball)
         return running_dir
 
@@ -1179,7 +1183,7 @@ def rush_to_stop_ball(obs, controlled_player_pos, ball_pos, offside_trap=False):
     ball_dir = obs['ball_direction']
     future_ball_pos = get_future_pos(ball_pos, ball_dir, steps=1)
 
-    dir_ball_to_goal = direction_mul(direction([-1, 0], future_ball_pos), 1/4)
+    dir_ball_to_goal = direction_mul(direction([-1, 0], future_ball_pos), 0.2)
     position = add(future_ball_pos, dir_ball_to_goal)
     # d = distance(position, controlled_player_pos)
 
@@ -1195,7 +1199,7 @@ def rush_to_stop_ball(obs, controlled_player_pos, ball_pos, offside_trap=False):
 
 
 def control_attacker(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir):
-    if are_defenders_behind(obs, controlled_player_pos) or ball_pos[0] < controlled_player_pos[0]:
+    if is_defender_behind(obs, controlled_player_pos) or ball_pos[0] < controlled_player_pos[0]:
         return retrieve_ball_asap(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
     else:
         if Action.Sprint in obs['sticky_actions']:
@@ -1385,13 +1389,13 @@ def agent(obs, modeled_action=None):
             distance_from_goal = dir_distance(goal_dir)
 
             # from close range shoot
-            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE):
+            if distance_from_goal <= SHORT_SHOOTING_DISTANCE and (controlled_player_pos_y == 0 or abs((1 - controlled_player_pos_x)/controlled_player_pos_y) >= SHORT_SHOOTING_ANGLE):
                 return Action.Shot
 
             if (distance_from_goal <= SHOOTING_DISTANCE and
-                (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= SHOOTING_ANGLE)) or \
+                (controlled_player_pos_y == 0 or abs((1 - controlled_player_pos_x)/controlled_player_pos_y) >= SHOOTING_ANGLE)) or \
                     (Action.Sprint in obs['sticky_actions'] and distance_from_goal <= LONG_SHOOTING_DISTANCE and
-                     (controlled_player_pos_y == 0 or abs(controlled_player_pos_x/controlled_player_pos_y) >= 2)):
+                     (controlled_player_pos_y == 0 or abs((1 - controlled_player_pos_x)/controlled_player_pos_y) >= LONG_SHOOTING_ANGLE)):
                 if goal_dir_action not in obs['sticky_actions']:
                     return goal_dir_action
 
@@ -1441,8 +1445,10 @@ def agent(obs, modeled_action=None):
                     if is_dangerous(obs, controlled_player_pos, [0, SAFE_DISTANCE]):
                         return cross(obs, running_dir)
                     return Action.Bottom
-                else:
+                elif controlled_player_pos_y == 0:
                     return Action.Shot
+                else:  # should never reach here
+                    return Action.LongPass
 
             is_one_on_one, marking_defs = is_1_on_1(obs, controlled_player_pos)
 
@@ -1579,4 +1585,7 @@ def agent(obs, modeled_action=None):
         else:  # ball_owned_team = 1, opponents
             return defend(obs, controlled_player_pos, controlled_player_dir, ball_pos, ball_dir)
     except Exception as e:
+        with open('./error_log', mode='a') as f:
+            f.write(traceback.format_exc())
+            f.write('\n')
         return Action.Idle
